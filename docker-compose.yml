@@ -1,0 +1,15 @@
+services:
+  checklist:
+    build: .
+    container_name: party-checklist
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      # Optional: set both to require a login before anyone can view/edit.
+      # Leave blank to allow anyone with the URL to use it (fine behind a
+      # Cloudflare Tunnel you're only sharing with a few people).
+      - BASIC_AUTH_USER=
+      - BASIC_AUTH_PASS=
+    restart: unless-stopped

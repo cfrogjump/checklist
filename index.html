@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Party Checklist</title>
+<style>
+  :root {
+    --paper: #faf7f2;
+    --ink: #2b2620;
+    --rule: #ddd5c8;
+    --accent: #b0592f;
+    --accent-soft: #e9d9cd;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    padding: 32px 16px 80px;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  h1 {
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 2rem;
+    letter-spacing: -0.01em;
+    margin: 0 0 4px;
+    border-bottom: 3px solid var(--ink);
+    padding-bottom: 12px;
+  }
+  .progress-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 16px 0 28px;
+    font-size: 0.85rem;
+    color: #6b6459;
+  }
+  .bar {
+    flex: 1;
+    height: 8px;
+    background: var(--rule);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    background: var(--accent);
+    width: 0%;
+    transition: width 0.25s ease;
+  }
+  .reset-btn {
+    background: none;
+    border: 1px solid var(--rule);
+    color: #6b6459;
+    font-size: 0.8rem;
+    padding: 5px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .reset-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .status {
+    font-size: 0.72rem;
+    color: #a39a8c;
+    text-align: right;
+    margin-top: -18px;
+    margin-bottom: 18px;
+  }
+  section { margin-bottom: 28px; }
+  .area-title {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.75rem;
+    color: var(--accent);
+    font-weight: 700;
+    margin: 24px 0 6px;
+  }
+  h2 {
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 1.3rem;
+    margin: 0 0 10px;
+    padding-top: 6px;
+  }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 7px 4px;
+    border-bottom: 1px solid var(--rule);
+    font-size: 1rem;
+  }
+  li:last-child { border-bottom: none; }
+  li input[type="checkbox"] {
+    margin-top: 3px;
+    width: 18px;
+    height: 18px;
+    accent-color: var(--accent);
+    flex-shrink: 0;
+  }
+  li label { cursor: pointer; flex: 1; }
+  li.checked label {
+    color: #a39a8c;
+    text-decoration: line-through;
+  }
+  .quest-box {
+    border: 1px dashed var(--accent);
+    border-radius: 8px;
+    padding: 12px 14px;
+    background: var(--accent-soft);
+    margin-top: 10px;
+  }
+  .quest-option {
+    font-size: 0.85rem;
+    color: #6b6459;
+    margin: 12px 0 4px;
+    font-weight: 600;
+  }
+  .quest-option:first-child { margin-top: 0; }
+  footer {
+    text-align: center;
+    font-size: 0.75rem;
+    color: #a39a8c;
+    margin-top: 40px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Party Checklist</h1>
+  <div class="progress-row">
+    <span id="progressLabel">0 / 0 done</span>
+    <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+    <button class="reset-btn" id="resetBtn">Reset all</button>
+  </div>
+  <div class="status" id="statusLine">syncing…</div>
+  <div id="content"></div>
+  <footer>Shared checklist — changes sync to everyone with this link.</footer>
+</div>
+
+<script>
+const content = document.getElementById("content");
+let groups = [];
+let state = {};
+let totalItems = 0;
+
+function fmtId(groupId, idx) { return groupId + "-" + idx; }
+
+function render() {
+  content.innerHTML = "";
+  totalItems = 0;
+  let lastSection = null;
+  let kitchenUl = null;
+  let questBox = null;
+
+  groups.forEach(group => {
+    if (group.id.startsWith("floor")) {
+      // Rendered inside the quest box, appended right after Kitchen.
+      return;
+    }
+    if (group.section !== lastSection) {
+      const heading = document.createElement("div");
+      heading.className = "area-title";
+      heading.textContent = group.section;
+      content.appendChild(heading);
+      lastSection = group.section;
+    }
+    const h2 = document.createElement("h2");
+    h2.textContent = group.title;
+    content.appendChild(h2);
+
+    const ul = document.createElement("ul");
+    ul.id = "list-" + group.id;
+    content.appendChild(ul);
+    fillList(ul, group);
+
+    if (group.id === "kitchen") {
+      questBox = document.createElement("div");
+      questBox.className = "quest-box";
+      const h4title = document.createElement("div");
+      h4title.style.fontWeight = "700";
+      h4title.style.fontSize = "0.9rem";
+      h4title.style.color = "var(--accent)";
+      h4title.textContent = "Floor Side Quest";
+      questBox.appendChild(h4title);
+      content.appendChild(questBox);
+
+      groups.filter(g => g.id.startsWith("floor")).forEach(fg => {
+        const label = document.createElement("div");
+        label.className = "quest-option";
+        label.textContent = fg.title.split("\u2014")[1] ? fg.title.split("\u2014")[1].trim() : fg.title;
+        questBox.appendChild(label);
+        const fUl = document.createElement("ul");
+        fUl.id = "list-" + fg.id;
+        questBox.appendChild(fUl);
+        fillList(fUl, fg);
+      });
+    }
+  });
+
+  updateProgress();
+}
+
+function fillList(ul, group) {
+  group.items.forEach((text, idx) => {
+    totalItems++;
+    const id = fmtId(group.id, idx);
+    const checked = !!state[id];
+    const li = document.createElement("li");
+    if (checked) li.classList.add("checked");
+    li.innerHTML = `<input type="checkbox" id="${id}" ${checked ? "checked" : ""}>
+      <label for="${id}">${text}</label>`;
+    ul.appendChild(li);
+    const cb = li.querySelector("input");
+    cb.addEventListener("change", () => toggle(id, cb.checked, li));
+  });
+}
+
+async function toggle(id, checked, li) {
+  li.classList.toggle("checked", checked);
+  state[id] = checked;
+  updateProgress();
+  try {
+    const res = await fetch("/api/toggle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, checked }),
+    });
+    const data = await res.json();
+    if (data.state) state = data.state;
+    setStatus("synced");
+  } catch (e) {
+    setStatus("offline — will retry");
+  }
+}
+
+function updateProgress() {
+  const doneCount = Object.values(state).filter(Boolean).length;
+  document.getElementById("progressLabel").textContent = `${doneCount} / ${totalItems} done`;
+  const pct = totalItems ? Math.round((doneCount / totalItems) * 100) : 0;
+  document.getElementById("barFill").style.width = pct + "%";
+}
+
+function setStatus(text) {
+  document.getElementById("statusLine").textContent = text;
+}
+
+async function loadChecklist() {
+  try {
+    const res = await fetch("/api/checklist");
+    const data = await res.json();
+    groups = data.groups;
+    state = data.state;
+    render();
+    setStatus("synced just now");
+  } catch (e) {
+    setStatus("couldn't reach server");
+  }
+}
+
+document.getElementById("resetBtn").addEventListener("click", async () => {
+  if (!confirm("Clear all checked items for everyone?")) return;
+  try {
+    const res = await fetch("/api/reset", { method: "POST" });
+    const data = await res.json();
+    state = data.state || {};
+    render();
+    setStatus("synced");
+  } catch (e) {
+    setStatus("couldn't reach server");
+  }
+});
+
+// Initial load, then poll periodically so everyone sees each other's checks.
+loadChecklist();
+setInterval(loadChecklist, 4000);
+</script>
+</body>
+</html>
