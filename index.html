@@ -131,6 +131,46 @@
     cursor: pointer;
   }
   .add-save:disabled { opacity: 0.6; cursor: default; }
+  li.empty-hint {
+    color: #a39a8c;
+    font-size: 0.85rem;
+    font-style: italic;
+    border-bottom: none;
+  }
+  .new-section-btn {
+    width: 100%;
+    margin-top: 10px;
+    padding: 12px;
+    background: none;
+    border: 1px dashed var(--rule);
+    border-radius: 8px;
+    color: #6b6459;
+    font: inherit;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  .new-section-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .new-section-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+    padding: 12px;
+    border: 1px dashed var(--accent);
+    border-radius: 8px;
+  }
+  .new-section-form input { flex: 1 1 150px; min-width: 0; }
+  .new-section-form input,
+  .new-section-form select {
+    font: inherit;
+    padding: 6px 10px;
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    background: #fff;
+    color: var(--ink);
+  }
+  .new-section-form input:focus,
+  .new-section-form select:focus { outline: none; border-color: var(--accent); }
   .quest-title {
     font-weight: 700;
     font-size: 0.9rem;
@@ -208,11 +248,14 @@
   </div>
   <div class="status" id="statusLine">syncing…</div>
   <div id="content"></div>
+  <!-- Outside #content so dragging a block to the bottom can't land past it. -->
+  <div id="newSection"></div>
   <footer>Shared checklist — changes sync to everyone with this link.</footer>
 </div>
 
 <script>
 const content = document.getElementById("content");
+const newSectionWrap = document.getElementById("newSection");
 let blocks = [];   // draggable units: one per group, floor groups merged into "floorquest"
 let state = {};
 let totalItems = 0;
@@ -255,6 +298,7 @@ function render() {
     }
     content.appendChild(renderBlock(block));
   });
+  renderNewSectionControl();
   updateProgress();
 }
 
@@ -407,6 +451,95 @@ function fillList(ul, group) {
     li.append(cb, label);
     ul.appendChild(li);
     cb.addEventListener("change", () => toggle(entry.id, cb.checked, li));
+  });
+  if (!entries.length) {
+    const hint = document.createElement("li");
+    hint.className = "empty-hint";
+    hint.textContent = "Nothing here yet — use + to add a task.";
+    ul.appendChild(hint);
+  }
+}
+
+// ---- add a section --------------------------------------------------------
+
+function areaNames() {
+  const seen = [];
+  blocks.forEach(b => b.groups.forEach(g => {
+    if (!seen.includes(g.section)) seen.push(g.section);
+  }));
+  return seen;
+}
+
+function renderNewSectionControl() {
+  newSectionWrap.innerHTML = "";
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "new-section-btn";
+  btn.textContent = "+ New section";
+  btn.addEventListener("click", openNewSectionForm);
+  newSectionWrap.appendChild(btn);
+}
+
+function openNewSectionForm() {
+  editing = true;
+  newSectionWrap.innerHTML = "";
+
+  const form = document.createElement("form");
+  form.className = "new-section-form";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "Section name, e.g. Garage";
+  input.maxLength = 60;
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", "Which area this section belongs under");
+  areaNames().forEach(area => {
+    const opt = document.createElement("option");
+    opt.value = area;
+    opt.textContent = area;
+    select.appendChild(opt);
+  });
+  const save = document.createElement("button");
+  save.type = "submit";
+  save.className = "add-save";
+  save.textContent = "Add section";
+  form.append(input, select, save);
+  newSectionWrap.appendChild(form);
+  input.focus();
+
+  const close = () => {
+    editing = false;
+    renderNewSectionControl();
+  };
+  form.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    if (save.disabled) return;
+    const title = input.value.trim();
+    if (!title) { close(); return; }
+    save.disabled = true;
+    try {
+      const res = await fetch("/api/add-section", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title, area: select.value }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus(data.error || "couldn't add section");
+        save.disabled = false;
+        return;
+      }
+      editing = false;
+      blocks = buildBlocks(data.groups);
+      state = data.state;
+      render();
+      setStatus("synced");
+    } catch (e) {
+      setStatus("offline — try again");
+      save.disabled = false;
+    }
+  });
+  input.addEventListener("keydown", ev => {
+    if (ev.key === "Escape") close();
   });
 }
 

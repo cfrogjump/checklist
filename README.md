@@ -12,7 +12,12 @@ single box.
 
 Each section also has a "+" button on the right of its title (one per
 sub-list inside the quest box) that opens an inline input for adding a
-task. Added tasks are saved server-side in `state.json` — not in
+task. A "+ New section" button at the bottom of the page creates a whole
+new section: give it a name and pick which area heading it belongs under
+(Outside / House), and it drops in alongside the other sections in that
+area rather than at the very bottom. Drag it wherever you like from there.
+
+Added tasks and sections are saved server-side in `state.json` — not in
 `checklist_items.py` — so they survive restarts and show up for everyone,
 no rebuild needed.
 
@@ -42,39 +47,125 @@ docker run -d --name party-checklist \
   party-checklist
 ```
 
-## Optional password
+## Signing in
 
-By default anyone with the URL can view and check items — fine if you're
-only sharing the link with a few people via a Cloudflare Tunnel. If you
-want a login prompt too, set both env vars (in `docker-compose.yml` or
-`docker run -e ...`):
+Opening the checklist pops up your browser's login box. Type your **first
+name** as the username and **leave the password blank** — that's the whole
+login. Capitalization doesn't matter (`cade`, `Cade`, and `CADE` all work),
+and surrounding spaces are trimmed.
 
-```
-BASIC_AUTH_USER=party
-BASIC_AUTH_PASS=something-not-guessable
-```
+The guest list is hardcoded as `ALLOWED_NAMES` near the top of
+`server.py`:
 
-## Exposing it via Cloudflare Tunnel
+> Cade · Cailin · Benton · Harley · Misty · Chelsea · Cami
 
-You don't need to open any ports on your router. From the machine running
-the container:
+To add or remove someone, edit that list and rebuild with
+`docker compose up -d --build`. Browsers cache Basic Auth credentials for
+the session, so a removed name stays signed in until they close the
+browser.
+
+`GET /healthz` is deliberately left open so container health checks and
+uptime monitors don't need credentials — point them at that path, and use
+GET rather than HEAD, which this server doesn't implement. Every other
+route and API endpoint requires a name.
+
+**This is a "keep strangers out" gate, not real security.** There is no
+password, the names are guessable by anyone who knows the household, and
+Basic Auth sends credentials on every request — safe enough over the
+HTTPS a Cloudflare Tunnel gives you, but don't put anything sensitive on
+this checklist. If you need the real thing, put Cloudflare Access in front
+of the hostname.
+
+## Exposing it via Cloudflare Tunnel (Ubuntu)
+
+You don't need to open any ports on your router or touch `ufw` —
+`cloudflared` only makes outbound connections. Run all of this on the
+Ubuntu box that's running the container.
+
+### 1. Install cloudflared
+
+Cloudflare's apt repo (recommended — you get updates with normal
+`apt upgrade`):
 
 ```bash
-# one-time: install cloudflared, then either
-cloudflared tunnel login
-
-# quick, no-account "Try" tunnel (random *.trycloudflare.com URL, resets
-# if it restarts — good for a one-off party):
-cloudflared tunnel --url http://localhost:8080
-
-# or a persistent named tunnel on your own domain:
-cloudflared tunnel create party-checklist
-cloudflared tunnel route dns party-checklist checklist.yourdomain.com
-cloudflared tunnel run --url http://localhost:8080 party-checklist
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update && sudo apt-get install -y cloudflared
 ```
 
-Share whichever URL cloudflared gives you (or your own subdomain) with
-the people you want checking things off. Nothing else needs to be public.
+The `any` codename works on every Debian/Ubuntu release; Cloudflare also
+publishes `focal`, `jammy`, `noble`, and `bookworm` if you'd rather pin to
+your exact release.
+
+Or grab the `.deb` directly (also the answer for a Raspberry Pi — check
+with `dpkg --print-architecture` and swap `amd64` for `arm64`):
+
+```bash
+curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb && sudo dpkg -i cloudflared.deb
+```
+
+Confirm with `cloudflared --version`.
+
+### 2a. Quick tunnel — no Cloudflare account
+
+```bash
+cloudflared tunnel --url http://localhost:8080
+```
+
+Prints a random `https://<words>.trycloudflare.com` URL. It runs in the
+foreground and the URL changes every restart, so run it inside `tmux` or
+`screen` if you don't want it dying with your SSH session. Fine for a
+one-off party.
+
+### 2b. Named tunnel on your own domain — survives restarts
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create party-checklist
+cloudflared tunnel route dns party-checklist checklist.yourdomain.com
+```
+
+`create` prints a tunnel UUID and writes credentials to
+`~/.cloudflared/<UUID>.json`. `route dns` adds the CNAME for you.
+
+Then write `~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: <TUNNEL-UUID>
+credentials-file: /home/<USER>/.cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  - hostname: checklist.yourdomain.com
+    service: http://localhost:8080
+  - service: http_status:404
+```
+
+Test it in the foreground with `cloudflared tunnel run party-checklist`,
+then Ctrl-C once you've confirmed the hostname loads.
+
+### 3. Keep it running at boot (systemd)
+
+```bash
+sudo cloudflared --config /home/$USER/.cloudflared/config.yml service install
+```
+
+Pass `--config` explicitly: under `sudo`, `$HOME` is `/root`, so
+cloudflared won't find the config in your user directory on its own. Then:
+
+```bash
+sudo systemctl enable --now cloudflared && systemctl status cloudflared
+```
+
+Edited `config.yml`? `sudo systemctl restart cloudflared`. Logs live in
+`journalctl -u cloudflared -f`.
+
+Share the tunnel URL (or your own subdomain) with whoever's helping.
+Nothing else on the box becomes public.
+
+Whoever you share it with will hit the first-name login described under
+[Signing in](#signing-in), so make sure they're on the `ALLOWED_NAMES`
+list before you send the link.
 
 ## Editing the checklist itself
 
@@ -95,11 +186,19 @@ to add new items at the end of a group, or do a reset after editing.
 - `POST /api/add-item` body `{ "group": "kitchen", "text": "Buy ice" }` → adds
   a task to that section (text capped at 200 chars, 100 added tasks per
   section); returns the same payload as `/api/checklist`
+- `POST /api/add-section` body `{ "title": "Garage", "area": "Outside" }` →
+  adds a section (title capped at 60 chars, 30 sections max; `area` defaults
+  to the last built-in area); returns the same payload as `/api/checklist`
 - `POST /api/reset` → clears all checked state (keeps the saved order and
-  any added tasks)
+  any added tasks and sections)
 - `GET /healthz` → `{ "ok": true }`
 
-`state.json` is stored as `{ "checked": {...}, "order": [...], "extras": {...} }`.
-Old-format files (a flat map of item ids) are migrated automatically on
-startup. Added tasks get ids like `kitchen-x3` ("x" keeps them clear of the
-index-based ids of the baked-in items).
+`state.json` is stored as
+`{ "checked": {...}, "order": [...], "extras": {...}, "sections": [...] }`.
+Older files — including the original flat map of item ids — are migrated
+automatically on startup. Added tasks get ids like `kitchen-x3` and added
+sections get `custom-1`; both namespaces are kept clear of the index-based
+ids of the baked-in items, so nothing shifts under existing checks.
+
+There's currently no way to **delete** an added task or section from the UI —
+edit `state.json` (`extras` / `sections`) and restart if you need to undo one.

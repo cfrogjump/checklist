@@ -7,11 +7,13 @@ Docker image needs nothing from PyPI. Serves a single-page checklist UI and
 a tiny JSON API backed by a file on disk, so multiple people hitting the
 same URL (e.g. via a Cloudflare Tunnel) see and update one shared state.
 
+Access is gated by HTTP Basic Auth against a hardcoded guest list: you type
+your first name as the username and leave the password blank. See
+ALLOWED_NAMES below.
+
 Env vars (all optional):
   PORT              - port to listen on (default 8080)
   DATA_DIR          - where to persist state.json (default /data)
-  BASIC_AUTH_USER   - if set together with BASIC_AUTH_PASS, requires HTTP
-  BASIC_AUTH_PASS     Basic Auth on every request
 """
 
 import base64
@@ -26,8 +28,15 @@ from checklist_items import GROUPS, all_item_ids
 PORT = int(os.environ.get("PORT", "8080"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
-AUTH_USER = os.environ.get("BASIC_AUTH_USER")
-AUTH_PASS = os.environ.get("BASIC_AUTH_PASS")
+
+# Who's allowed in. Sign in with any of these as the Basic Auth username
+# (any capitalization); the password box is ignored, so leave it blank.
+# This keeps strangers who stumble onto the tunnel URL out — it is not real
+# security, since anyone who knows the household can guess a name.
+ALLOWED_NAMES = [
+    "Cade", "Cailin", "Benton", "Harley", "Misty", "Chelsea", "Cami",
+]
+_NAMES_BY_KEY = {name.casefold(): name for name in ALLOWED_NAMES}
 
 INDEX_HTML_PATH = Path(__file__).parent / "index.html"
 
@@ -40,20 +49,23 @@ def _load_state():
             with STATE_FILE.open("r") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                if "checked" in data or "order" in data or "extras" in data:
+                known = ("checked", "order", "extras", "sections")
+                if any(key in data for key in known):
                     checked = data.get("checked")
                     order = data.get("order")
                     extras = data.get("extras")
+                    sections = data.get("sections")
                     return {
                         "checked": checked if isinstance(checked, dict) else {},
                         "order": order if isinstance(order, list) else [],
                         "extras": extras if isinstance(extras, dict) else {},
+                        "sections": sections if isinstance(sections, list) else [],
                     }
                 # Legacy format: a flat {item_id: bool} dict.
-                return {"checked": data, "order": [], "extras": {}}
+                return {"checked": data, "order": [], "extras": {}, "sections": []}
         except (json.JSONDecodeError, OSError):
             pass
-    return {"checked": {}, "order": [], "extras": {}}
+    return {"checked": {}, "order": [], "extras": {}, "sections": []}
 
 
 def _save_state(state):
@@ -66,12 +78,17 @@ def _save_state(state):
 
 # In-memory cache of state, mirrored to disk on every write.
 # Shape: {"checked": {item_id: bool}, "order": [group_id, ...],
-#         "extras": {group_id: [{"id": "<gid>-x<n>", "text": str}, ...]}}
-# "extras" are user-added items; baked-in items live in checklist_items.py.
+#         "extras": {group_id: [{"id": "<gid>-x<n>", "text": str}, ...]},
+#         "sections": [{"id": "custom-<n>", "section": str, "title": str}]}
+# "extras" and "sections" are user-added; the baked-in checklist lives in
+# checklist_items.py. User-added sections have no baked-in items of their
+# own — everything in them is an "extras" entry.
 _state = _load_state()
 
 MAX_ITEM_TEXT = 200
 MAX_EXTRAS_PER_GROUP = 100
+MAX_TITLE_LEN = 60
+MAX_CUSTOM_SECTIONS = 30
 
 
 def _next_extra_id(group_id):
@@ -94,23 +111,63 @@ def _valid_item_ids_locked():
     return ids
 
 
+def _next_section_id():
+    """User-added section ids look like "custom-3". The "custom-" prefix keeps
+    them clear of the ids in checklist_items.py, and containing no "-x" keeps
+    _next_extra_id's parsing unambiguous."""
+    n = 0
+    for section in _state["sections"]:
+        sid = str(section.get("id", ""))
+        suffix = sid[len("custom-"):]
+        if sid.startswith("custom-") and suffix.isdigit():
+            n = max(n, int(suffix))
+    return f"custom-{n + 1}"
+
+
+def _all_groups_locked():
+    """Baked-in groups plus user-added sections, in canonical (unordered)
+    form. User-added sections carry no baked-in items."""
+    groups = list(GROUPS)
+    for section in _state["sections"]:
+        groups.append({
+            "section": section["section"],
+            "id": section["id"],
+            "title": section["title"],
+            "items": [],
+        })
+    return groups
+
+
+def _all_group_ids_locked():
+    return {g["id"] for g in _all_groups_locked()}
+
+
 def _checklist_payload_locked():
     groups = []
-    for g in _ordered_groups(_state["order"]):
+    for g in _ordered_groups(_state["order"], _all_groups_locked()):
         g2 = dict(g)
         g2["extras"] = list(_state["extras"].get(g["id"], []))
         groups.append(g2)
     return {"groups": groups, "state": dict(_state["checked"])}
 
 
-def _ordered_groups(order):
-    """GROUPS sorted by the saved order; unknown ids are ignored and any
-    groups missing from the saved order keep their canonical position at
-    the end (covers groups added to checklist_items.py later)."""
-    by_id = {g["id"]: g for g in GROUPS}
+def _ordered_groups(order, groups):
+    """Groups sorted by the saved order. Unknown ids in the order are ignored.
+    Groups missing from it — a section someone just added, or a new entry in
+    checklist_items.py — slot in after the last group sharing their area
+    heading, so a new "Outside" section doesn't strand itself under a second
+    OUTSIDE heading at the bottom. Falls back to the end."""
+    by_id = {g["id"]: g for g in groups}
     ordered = [by_id[gid] for gid in order if gid in by_id]
     seen = set(order)
-    ordered.extend(g for g in GROUPS if g["id"] not in seen)
+    for group in groups:
+        if group["id"] in seen:
+            continue
+        pos = len(ordered)
+        for i, placed in enumerate(ordered):
+            if placed["section"] == group["section"]:
+                pos = i + 1
+        ordered.insert(pos, group)
     return ordered
 
 
@@ -123,24 +180,38 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- auth -----------------------------------------------------------
 
-    def _authorized(self):
-        if not (AUTH_USER and AUTH_PASS):
-            return True
+    def _auth_name(self):
+        """Return the guest's canonical name, or None if they're not on the
+        list. The password half of the credentials is deliberately ignored."""
         header = self.headers.get("Authorization", "")
         if not header.startswith("Basic "):
-            return False
+            return None
         try:
             decoded = base64.b64decode(header[6:]).decode("utf-8")
         except Exception:
-            return False
-        user, _, pw = decoded.partition(":")
-        return user == AUTH_USER and pw == AUTH_PASS
+            return None
+        user, _, _pw = decoded.partition(":")
+        return _NAMES_BY_KEY.get(user.strip().casefold())
+
+    def _authorized(self):
+        return self._auth_name() is not None
 
     def _require_auth(self):
+        # Header values must be latin-1 encodable, so keep the realm ASCII.
+        body = (
+            b"<!DOCTYPE html><meta charset=utf-8>"
+            b"<p style='font:16px system-ui;padding:2rem'>"
+            b"Sign in with your first name. Leave the password blank."
+        )
         self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Party Checklist"')
-        self.send_header("Content-Length", "0")
+        self.send_header(
+            "WWW-Authenticate",
+            'Basic realm="Party Checklist - your first name, no password"',
+        )
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self.wfile.write(body)
 
     # ---- helpers ----------------------------------------------------------
 
@@ -173,6 +244,10 @@ class Handler(BaseHTTPRequestHandler):
     # ---- routes -------------------------------------------------------
 
     def do_GET(self):
+        # Left open so container/uptime health checks don't need credentials.
+        if self.path == "/healthz":
+            return self._send_json({"ok": True})
+
         if not self._authorized():
             return self._require_auth()
 
@@ -183,9 +258,6 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 payload = _checklist_payload_locked()
             return self._send_json(payload)
-
-        if self.path == "/healthz":
-            return self._send_json({"ok": True})
 
         self.send_response(404)
         self.send_header("Content-Length", "0")
@@ -214,35 +286,61 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json_body()
             group_id = body.get("group")
             text = str(body.get("text") or "").strip()[:MAX_ITEM_TEXT]
-            if group_id not in {g["id"] for g in GROUPS}:
-                return self._send_json({"error": "unknown group"}, status=400)
             if not text:
                 return self._send_json({"error": "empty item text"}, status=400)
             with _lock:
-                items = _state["extras"].setdefault(group_id, [])
-                if len(items) >= MAX_EXTRAS_PER_GROUP:
+                # Validated under the lock: user-added sections are valid
+                # targets too, and they can appear between requests.
+                if group_id not in _all_group_ids_locked():
+                    payload, error = None, "unknown group"
+                else:
+                    items = _state["extras"].setdefault(group_id, [])
+                    if len(items) >= MAX_EXTRAS_PER_GROUP:
+                        payload, error = None, "section is full"
+                    else:
+                        items.append({"id": _next_extra_id(group_id), "text": text})
+                        _save_state(_state)
+                        payload, error = _checklist_payload_locked(), None
+            if payload is None:
+                return self._send_json({"error": error}, status=400)
+            return self._send_json(payload)
+
+        if self.path == "/api/add-section":
+            body = self._read_json_body()
+            title = str(body.get("title") or "").strip()[:MAX_TITLE_LEN]
+            area = str(body.get("area") or "").strip()[:MAX_TITLE_LEN]
+            if not title:
+                return self._send_json({"error": "empty section title"}, status=400)
+            with _lock:
+                if len(_state["sections"]) >= MAX_CUSTOM_SECTIONS:
                     payload = None
                 else:
-                    items.append({"id": _next_extra_id(group_id), "text": text})
+                    _state["sections"].append({
+                        "id": _next_section_id(),
+                        # Unrecognized or missing area lands with the last
+                        # baked-in group's heading rather than inventing one.
+                        "section": area or GROUPS[-1]["section"],
+                        "title": title,
+                    })
                     _save_state(_state)
                     payload = _checklist_payload_locked()
             if payload is None:
-                return self._send_json({"error": "section is full"}, status=400)
+                return self._send_json({"error": "too many sections"}, status=400)
             return self._send_json(payload)
 
         if self.path == "/api/order":
             body = self._read_json_body()
             order = body.get("order")
-            valid_ids = {g["id"] for g in GROUPS}
-            if (
-                not isinstance(order, list)
-                or len(order) != len(set(map(str, order)))
-                or not all(isinstance(gid, str) and gid in valid_ids for gid in order)
-            ):
+            if not isinstance(order, list) or len(order) != len(set(map(str, order))):
                 return self._send_json({"error": "invalid order"}, status=400)
             with _lock:
-                _state["order"] = order
-                _save_state(_state)
+                valid_ids = _all_group_ids_locked()
+                ok = all(isinstance(g, str) and g in valid_ids for g in order)
+                if ok:
+                    _state["order"] = order
+                    _save_state(_state)
+            if not ok:
+                return self._send_json({"error": "invalid order"}, status=400)
             return self._send_json({"ok": True})
 
         if self.path == "/api/reset":
@@ -261,10 +359,7 @@ def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Party Checklist serving on :{PORT}, data dir {DATA_DIR}")
-    if AUTH_USER and AUTH_PASS:
-        print("Basic Auth: enabled")
-    else:
-        print("Basic Auth: disabled (set BASIC_AUTH_USER/BASIC_AUTH_PASS to enable)")
+    print(f"Sign-in: first name only, {len(ALLOWED_NAMES)} guests on the list")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

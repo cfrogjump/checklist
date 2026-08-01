@@ -6,10 +6,6 @@ services:
       - "8080:8080"
     volumes:
       - ./data:/data
-    environment:
-      # Optional: set both to require a login before anyone can view/edit.
-      # Leave blank to allow anyone with the URL to use it (fine behind a
-      # Cloudflare Tunnel you're only sharing with a few people).
-      - BASIC_AUTH_USER=
-      - BASIC_AUTH_PASS=
+    # Sign-in is a first-name guest list hardcoded in checklist_items' sibling
+    # server.py (ALLOWED_NAMES) — no credentials to configure here.
     restart: unless-stopped
