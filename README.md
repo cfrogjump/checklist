@@ -5,6 +5,17 @@ persists state to a JSON file on a mounted volume, and serves a web UI +
 small JSON API. Everyone who opens the URL sees and checks off the same
 list (state syncs via a 4-second poll).
 
+Sections can be reordered by dragging the ⠿ handle next to each title
+(works with mouse and touch). The order is saved server-side, so everyone
+sees the same arrangement. The three "Floor Side Quest" groups move as a
+single box.
+
+Each section also has a "+" button on the right of its title (one per
+sub-list inside the quest box) that opens an inline input for adding a
+task. Added tasks are saved server-side in `state.json` — not in
+`checklist_items.py` — so they survive restarts and show up for everyone,
+no rebuild needed.
+
 No external packages are installed — the server uses only the Python
 standard library, so the image builds fully offline once the base
 `python:3.12-alpine` layer is pulled.
@@ -77,6 +88,18 @@ to add new items at the end of a group, or do a reset after editing.
 ## API (in case you want to script against it)
 
 - `GET /api/checklist` → `{ groups: [...], state: { "<id>": true/false } }`
+  (groups come back in the saved display order)
 - `POST /api/toggle` body `{ "id": "kitchen-2", "checked": true }` → returns updated state
-- `POST /api/reset` → clears all checked state
+- `POST /api/order` body `{ "order": ["patio", "yardwork", ...] }` → saves the
+  group display order (ids must all be valid group ids, no duplicates)
+- `POST /api/add-item` body `{ "group": "kitchen", "text": "Buy ice" }` → adds
+  a task to that section (text capped at 200 chars, 100 added tasks per
+  section); returns the same payload as `/api/checklist`
+- `POST /api/reset` → clears all checked state (keeps the saved order and
+  any added tasks)
 - `GET /healthz` → `{ "ok": true }`
+
+`state.json` is stored as `{ "checked": {...}, "order": [...], "extras": {...} }`.
+Old-format files (a flat map of item ids) are migrated automatically on
+startup. Added tasks get ids like `kitchen-x3` ("x" keeps them clear of the
+index-based ids of the baked-in items).

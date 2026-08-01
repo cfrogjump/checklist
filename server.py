@@ -39,11 +39,21 @@ def _load_state():
         try:
             with STATE_FILE.open("r") as f:
                 data = json.load(f)
-                if isinstance(data, dict):
-                    return data
+            if isinstance(data, dict):
+                if "checked" in data or "order" in data or "extras" in data:
+                    checked = data.get("checked")
+                    order = data.get("order")
+                    extras = data.get("extras")
+                    return {
+                        "checked": checked if isinstance(checked, dict) else {},
+                        "order": order if isinstance(order, list) else [],
+                        "extras": extras if isinstance(extras, dict) else {},
+                    }
+                # Legacy format: a flat {item_id: bool} dict.
+                return {"checked": data, "order": [], "extras": {}}
         except (json.JSONDecodeError, OSError):
             pass
-    return {}
+    return {"checked": {}, "order": [], "extras": {}}
 
 
 def _save_state(state):
@@ -55,7 +65,53 @@ def _save_state(state):
 
 
 # In-memory cache of state, mirrored to disk on every write.
+# Shape: {"checked": {item_id: bool}, "order": [group_id, ...],
+#         "extras": {group_id: [{"id": "<gid>-x<n>", "text": str}, ...]}}
+# "extras" are user-added items; baked-in items live in checklist_items.py.
 _state = _load_state()
+
+MAX_ITEM_TEXT = 200
+MAX_EXTRAS_PER_GROUP = 100
+
+
+def _next_extra_id(group_id):
+    """Extra-item ids look like "kitchen-x7". The "x" keeps them out of the
+    baked-in "<gid>-<index>" namespace; the counter is the max suffix across
+    all groups so ids stay unique for a group even if items move later."""
+    n = 0
+    for items in _state["extras"].values():
+        for item in items:
+            parts = str(item.get("id", "")).rsplit("-x", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                n = max(n, int(parts[1]))
+    return f"{group_id}-x{n + 1}"
+
+
+def _valid_item_ids_locked():
+    ids = set(all_item_ids())
+    for items in _state["extras"].values():
+        ids.update(str(item.get("id")) for item in items)
+    return ids
+
+
+def _checklist_payload_locked():
+    groups = []
+    for g in _ordered_groups(_state["order"]):
+        g2 = dict(g)
+        g2["extras"] = list(_state["extras"].get(g["id"], []))
+        groups.append(g2)
+    return {"groups": groups, "state": dict(_state["checked"])}
+
+
+def _ordered_groups(order):
+    """GROUPS sorted by the saved order; unknown ids are ignored and any
+    groups missing from the saved order keep their canonical position at
+    the end (covers groups added to checklist_items.py later)."""
+    by_id = {g["id"]: g for g in GROUPS}
+    ordered = [by_id[gid] for gid in order if gid in by_id]
+    seen = set(order)
+    ordered.extend(g for g in GROUPS if g["id"] not in seen)
+    return ordered
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -125,8 +181,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/api/checklist":
             with _lock:
-                state_copy = dict(_state)
-            return self._send_json({"groups": GROUPS, "state": state_copy})
+                payload = _checklist_payload_locked()
+            return self._send_json(payload)
 
         if self.path == "/healthz":
             return self._send_json({"ok": True})
@@ -143,18 +199,56 @@ class Handler(BaseHTTPRequestHandler):
             body = self._read_json_body()
             item_id = body.get("id")
             checked = bool(body.get("checked"))
-            valid_ids = set(all_item_ids())
-            if item_id not in valid_ids:
-                return self._send_json({"error": "unknown item id"}, status=400)
             with _lock:
-                _state[item_id] = checked
-                _save_state(_state)
-                state_copy = dict(_state)
+                if item_id not in _valid_item_ids_locked():
+                    state_copy = None
+                else:
+                    _state["checked"][item_id] = checked
+                    _save_state(_state)
+                    state_copy = dict(_state["checked"])
+            if state_copy is None:
+                return self._send_json({"error": "unknown item id"}, status=400)
             return self._send_json({"state": state_copy})
 
-        if self.path == "/api/reset":
+        if self.path == "/api/add-item":
+            body = self._read_json_body()
+            group_id = body.get("group")
+            text = str(body.get("text") or "").strip()[:MAX_ITEM_TEXT]
+            if group_id not in {g["id"] for g in GROUPS}:
+                return self._send_json({"error": "unknown group"}, status=400)
+            if not text:
+                return self._send_json({"error": "empty item text"}, status=400)
             with _lock:
-                _state.clear()
+                items = _state["extras"].setdefault(group_id, [])
+                if len(items) >= MAX_EXTRAS_PER_GROUP:
+                    payload = None
+                else:
+                    items.append({"id": _next_extra_id(group_id), "text": text})
+                    _save_state(_state)
+                    payload = _checklist_payload_locked()
+            if payload is None:
+                return self._send_json({"error": "section is full"}, status=400)
+            return self._send_json(payload)
+
+        if self.path == "/api/order":
+            body = self._read_json_body()
+            order = body.get("order")
+            valid_ids = {g["id"] for g in GROUPS}
+            if (
+                not isinstance(order, list)
+                or len(order) != len(set(map(str, order)))
+                or not all(isinstance(gid, str) and gid in valid_ids for gid in order)
+            ):
+                return self._send_json({"error": "invalid order"}, status=400)
+            with _lock:
+                _state["order"] = order
+                _save_state(_state)
+            return self._send_json({"ok": True})
+
+        if self.path == "/api/reset":
+            # Clears everyone's checks; the saved section order is kept.
+            with _lock:
+                _state["checked"].clear()
                 _save_state(_state)
             return self._send_json({"state": {}})
 

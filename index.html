@@ -67,7 +67,75 @@
     margin-top: -18px;
     margin-bottom: 18px;
   }
-  section { margin-bottom: 28px; }
+  .group-block { margin-bottom: 18px; }
+  .block-header { display: flex; align-items: center; gap: 6px; }
+  .block-header h2 { margin: 0; padding: 0; }
+  .drag-handle {
+    background: none;
+    border: none;
+    padding: 2px 6px;
+    margin-left: -6px;
+    color: #a39a8c;
+    font-size: 1.05rem;
+    line-height: 1;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .drag-handle:active { cursor: grabbing; color: var(--accent); }
+  .group-block.dragging {
+    opacity: 0.92;
+    background: var(--paper);
+    box-shadow: 0 6px 18px rgba(43, 38, 32, 0.18);
+    border-radius: 8px;
+    position: relative;
+    z-index: 5;
+  }
+  .drag-active .area-title { opacity: 0.35; }
+  .add-btn {
+    margin-left: auto;
+    background: none;
+    border: 1px solid var(--rule);
+    color: var(--accent);
+    border-radius: 6px;
+    width: 26px;
+    height: 26px;
+    line-height: 1;
+    font-size: 1.05rem;
+    cursor: pointer;
+    flex-shrink: 0;
+    padding: 0;
+  }
+  .add-btn:hover { border-color: var(--accent); background: var(--accent-soft); }
+  li.add-row { border-bottom: none; padding: 8px 4px; }
+  .add-row form { display: flex; flex: 1; gap: 8px; min-width: 0; }
+  .add-row input {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    padding: 6px 10px;
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    background: #fff;
+    color: var(--ink);
+  }
+  .add-row input:focus { outline: none; border-color: var(--accent); }
+  .add-save {
+    background: var(--accent);
+    border: none;
+    color: #fff;
+    font-size: 0.85rem;
+    padding: 7px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .add-save:disabled { opacity: 0.6; cursor: default; }
+  .quest-title {
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--accent);
+  }
   .area-title {
     text-transform: uppercase;
     letter-spacing: 0.08em;
@@ -112,11 +180,15 @@
     margin-top: 10px;
   }
   .quest-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     font-size: 0.85rem;
     color: #6b6459;
     margin: 12px 0 4px;
     font-weight: 600;
   }
+  .quest-option .add-btn { width: 22px; height: 22px; font-size: 0.95rem; }
   .quest-option:first-child { margin-top: 0; }
   footer {
     text-align: center;
@@ -141,79 +213,274 @@
 
 <script>
 const content = document.getElementById("content");
-let groups = [];
+let blocks = [];   // draggable units: one per group, floor groups merged into "floorquest"
 let state = {};
 let totalItems = 0;
+let dragging = false;
+let editing = false;  // an "add task" input is open
 
 function fmtId(groupId, idx) { return groupId + "-" + idx; }
+
+// The three floor groups render inside one quest box, so they drag as a
+// single unit anchored wherever the first floor group sits in the order.
+function buildBlocks(groups) {
+  const out = [];
+  let quest = null;
+  groups.forEach(g => {
+    if (g.id.startsWith("floor")) {
+      if (!quest) {
+        quest = { id: "floorquest", groups: [] };
+        out.push(quest);
+      }
+      quest.groups.push(g);
+    } else {
+      out.push({ id: g.id, groups: [g] });
+    }
+  });
+  return out;
+}
 
 function render() {
   content.innerHTML = "";
   totalItems = 0;
   let lastSection = null;
-  let kitchenUl = null;
-  let questBox = null;
-
-  groups.forEach(group => {
-    if (group.id.startsWith("floor")) {
-      // Rendered inside the quest box, appended right after Kitchen.
-      return;
-    }
-    if (group.section !== lastSection) {
+  blocks.forEach(block => {
+    const section = block.groups[0].section;
+    if (section !== lastSection) {
       const heading = document.createElement("div");
       heading.className = "area-title";
-      heading.textContent = group.section;
+      heading.textContent = section;
       content.appendChild(heading);
-      lastSection = group.section;
+      lastSection = section;
     }
-    const h2 = document.createElement("h2");
-    h2.textContent = group.title;
-    content.appendChild(h2);
-
-    const ul = document.createElement("ul");
-    ul.id = "list-" + group.id;
-    content.appendChild(ul);
-    fillList(ul, group);
-
-    if (group.id === "kitchen") {
-      questBox = document.createElement("div");
-      questBox.className = "quest-box";
-      const h4title = document.createElement("div");
-      h4title.style.fontWeight = "700";
-      h4title.style.fontSize = "0.9rem";
-      h4title.style.color = "var(--accent)";
-      h4title.textContent = "Floor Side Quest";
-      questBox.appendChild(h4title);
-      content.appendChild(questBox);
-
-      groups.filter(g => g.id.startsWith("floor")).forEach(fg => {
-        const label = document.createElement("div");
-        label.className = "quest-option";
-        label.textContent = fg.title.split("\u2014")[1] ? fg.title.split("\u2014")[1].trim() : fg.title;
-        questBox.appendChild(label);
-        const fUl = document.createElement("ul");
-        fUl.id = "list-" + fg.id;
-        questBox.appendChild(fUl);
-        fillList(fUl, fg);
-      });
-    }
+    content.appendChild(renderBlock(block));
   });
-
   updateProgress();
 }
 
+function renderBlock(block) {
+  const wrap = document.createElement("div");
+  wrap.className = "group-block";
+  wrap.dataset.blockId = block.id;
+
+  const header = document.createElement("div");
+  header.className = "block-header";
+  const handle = document.createElement("button");
+  handle.className = "drag-handle";
+  handle.type = "button";
+  handle.textContent = "\u283f";
+  handle.setAttribute("aria-label", "Drag to reorder");
+  header.appendChild(handle);
+
+  if (block.id === "floorquest") {
+    const box = document.createElement("div");
+    box.className = "quest-box";
+    const title = document.createElement("div");
+    title.className = "quest-title";
+    title.textContent = "Floor Side Quest";
+    header.appendChild(title);
+    box.appendChild(header);
+    block.groups.forEach(fg => {
+      const row = document.createElement("div");
+      row.className = "quest-option";
+      const label = document.createElement("span");
+      const sub = fg.title.split("\u2014")[1];
+      label.textContent = sub ? sub.trim() : fg.title;
+      row.appendChild(label);
+      box.appendChild(row);
+      const ul = document.createElement("ul");
+      box.appendChild(ul);
+      fillList(ul, fg);
+      row.appendChild(makeAddButton(fg.id, ul));
+    });
+    wrap.appendChild(box);
+  } else {
+    const group = block.groups[0];
+    const h2 = document.createElement("h2");
+    h2.textContent = group.title;
+    header.appendChild(h2);
+    wrap.appendChild(header);
+    const ul = document.createElement("ul");
+    wrap.appendChild(ul);
+    fillList(ul, group);
+    header.appendChild(makeAddButton(group.id, ul));
+  }
+
+  handle.addEventListener("pointerdown", e => startDrag(e, wrap, handle));
+  return wrap;
+}
+
+// ---- drag to reorder ------------------------------------------------------
+// Pointer events (not HTML5 drag-and-drop) so it works on touch screens.
+
+let scrollRAF = 0;
+let lastPointerY = 0;
+
+function startDrag(e, blockEl, handle) {
+  e.preventDefault();
+  dragging = true;
+  lastPointerY = e.clientY;
+  blockEl.classList.add("dragging");
+  content.classList.add("drag-active");
+  // Keeps touch pointers feeding us moves; window listeners below do the
+  // actual work so the drag also survives losing capture.
+  try { handle.setPointerCapture(e.pointerId); } catch (err) {}
+
+  const onMove = ev => {
+    lastPointerY = ev.clientY;
+    positionBlock(blockEl, ev.clientY);
+  };
+  const onUp = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onUp);
+    cancelAnimationFrame(scrollRAF);
+    blockEl.classList.remove("dragging");
+    content.classList.remove("drag-active");
+    dragging = false;
+    commitOrder();
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onUp);
+
+  // Keep scrolling while the pointer is held near the viewport edge.
+  const scrollLoop = () => {
+    if (!dragging) return;
+    const margin = 70, step = 12;
+    if (lastPointerY < margin) window.scrollBy(0, -step);
+    else if (lastPointerY > window.innerHeight - margin) window.scrollBy(0, step);
+    positionBlock(blockEl, lastPointerY);
+    scrollRAF = requestAnimationFrame(scrollLoop);
+  };
+  scrollRAF = requestAnimationFrame(scrollLoop);
+}
+
+function positionBlock(blockEl, y) {
+  const others = [...content.querySelectorAll(".group-block")].filter(el => el !== blockEl);
+  let target = null;
+  for (const el of others) {
+    const r = el.getBoundingClientRect();
+    if (y < r.top + r.height / 2) { target = el; break; }
+  }
+  if (target) content.insertBefore(blockEl, target);
+  else content.appendChild(blockEl);
+}
+
+function commitOrder() {
+  const ids = [...content.querySelectorAll(".group-block")].map(el => el.dataset.blockId);
+  blocks.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
+  render();  // fixes up the section headings around the new order
+  postOrder();
+}
+
+async function postOrder() {
+  const order = [];
+  blocks.forEach(b => b.groups.forEach(g => order.push(g.id)));
+  try {
+    const res = await fetch("/api/order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order }),
+    });
+    setStatus(res.ok ? "synced" : "couldn't save order");
+  } catch (e) {
+    setStatus("offline \u2014 will retry");
+  }
+}
+
 function fillList(ul, group) {
-  group.items.forEach((text, idx) => {
+  const entries = group.items.map((text, idx) => ({ id: fmtId(group.id, idx), text }));
+  (group.extras || []).forEach(x => entries.push({ id: x.id, text: x.text }));
+  entries.forEach(entry => {
     totalItems++;
-    const id = fmtId(group.id, idx);
-    const checked = !!state[id];
+    const checked = !!state[entry.id];
     const li = document.createElement("li");
     if (checked) li.classList.add("checked");
-    li.innerHTML = `<input type="checkbox" id="${id}" ${checked ? "checked" : ""}>
-      <label for="${id}">${text}</label>`;
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.id = entry.id;
+    cb.checked = checked;
+    const label = document.createElement("label");
+    label.htmlFor = entry.id;
+    label.textContent = entry.text;  // textContent: item text is user-supplied
+    li.append(cb, label);
     ul.appendChild(li);
-    const cb = li.querySelector("input");
-    cb.addEventListener("change", () => toggle(id, cb.checked, li));
+    cb.addEventListener("change", () => toggle(entry.id, cb.checked, li));
+  });
+}
+
+// ---- add a task -----------------------------------------------------------
+
+function makeAddButton(groupId, ul) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "add-btn";
+  btn.textContent = "+";
+  btn.title = "Add a task";
+  btn.setAttribute("aria-label", "Add a task to this section");
+  btn.addEventListener("click", () => openAddRow(groupId, ul));
+  return btn;
+}
+
+function openAddRow(groupId, ul) {
+  const existing = ul.querySelector(".add-row");
+  if (existing) { existing.querySelector("input").focus(); return; }
+  editing = true;
+
+  const li = document.createElement("li");
+  li.className = "add-row";
+  const form = document.createElement("form");
+  const input = document.createElement("input");
+  input.type = "text";
+  input.placeholder = "New task…";
+  input.maxLength = 200;
+  const save = document.createElement("button");
+  save.type = "submit";  // real form: Enter submits, phones show a "Go" key
+  save.className = "add-save";
+  save.textContent = "Add";
+  form.append(input, save);
+  li.appendChild(form);
+  ul.appendChild(li);
+  input.focus();
+
+  const close = () => {
+    li.remove();
+    editing = !!document.querySelector(".add-row");
+  };
+  const submit = async () => {
+    if (save.disabled) return;
+    const text = input.value.trim();
+    if (!text) { close(); return; }
+    save.disabled = true;
+    try {
+      const res = await fetch("/api/add-item", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ group: groupId, text }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus(data.error || "couldn't add task");
+        save.disabled = false;
+        return;
+      }
+      editing = false;
+      blocks = buildBlocks(data.groups);
+      state = data.state;
+      render();
+      setStatus("synced");
+    } catch (e) {
+      setStatus("offline — try again");
+      save.disabled = false;
+    }
+  };
+  form.addEventListener("submit", ev => {
+    ev.preventDefault();
+    submit();
+  });
+  input.addEventListener("keydown", ev => {
+    if (ev.key === "Escape") close();
   });
 }
 
@@ -247,10 +514,12 @@ function setStatus(text) {
 }
 
 async function loadChecklist() {
+  if (dragging || editing) return;  // don't yank the list out from under a drag or typing
   try {
     const res = await fetch("/api/checklist");
     const data = await res.json();
-    groups = data.groups;
+    if (dragging || editing) return;  // may have started while we were fetching
+    blocks = buildBlocks(data.groups);
     state = data.state;
     render();
     setStatus("synced just now");
