@@ -3,7 +3,10 @@
 A tiny, dependency-free shared checklist. Runs as one Docker container,
 persists state to a JSON file on a mounted volume, and serves a web UI +
 small JSON API. Everyone who opens the URL sees and checks off the same
-list (state syncs via a 4-second poll).
+list, and changes are pushed to every open page over Server-Sent Events —
+so a tick, a new task, or a reorder shows up for everyone in well under a
+second, with no refresh. A 30-second poll runs alongside it as a safety
+net in case something between you and the server won't pass a stream.
 
 Sections can be reordered by dragging the ⠿ handle next to each title
 (works with mouse and touch). The order is saved server-side, so everyone
@@ -180,6 +183,11 @@ to add new items at the end of a group, or do a reset after editing.
 
 - `GET /api/checklist` → `{ groups: [...], state: { "<id>": true/false } }`
   (groups come back in the saved display order)
+- `GET /api/events` → Server-Sent Events stream. Sends the full
+  `/api/checklist` payload on connect and again after every write, plus a
+  `: ping` comment every 25s so idle streams survive proxy timeouts
+  (Cloudflare's is ~100s). Each open page holds one connection, and one
+  server thread, for as long as its tab is open.
 - `POST /api/toggle` body `{ "id": "kitchen-2", "checked": true }` → returns updated state
 - `POST /api/order` body `{ "order": ["patio", "yardwork", ...] }` → saves the
   group display order (ids must all be valid group ids, no duplicates)

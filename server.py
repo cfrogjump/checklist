@@ -19,6 +19,7 @@ Env vars (all optional):
 import base64
 import json
 import os
+import queue
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -90,6 +91,15 @@ MAX_EXTRAS_PER_GROUP = 100
 MAX_TITLE_LEN = 60
 MAX_CUSTOM_SECTIONS = 30
 
+# One queue per open /api/events stream. Every write broadcasts the new
+# checklist to all of them, so viewers update in well under a second instead
+# of waiting for a poll. A comment line every SSE_HEARTBEAT_SECONDS keeps
+# idle streams from being closed by a proxy (Cloudflare's is ~100s).
+_subscribers = set()
+_subscribers_lock = threading.Lock()
+SSE_HEARTBEAT_SECONDS = 25
+SSE_QUEUE_DEPTH = 32
+
 
 def _next_extra_id(group_id):
     """Extra-item ids look like "kitchen-x7". The "x" keeps them out of the
@@ -149,6 +159,19 @@ def _checklist_payload_locked():
         g2["extras"] = list(_state["extras"].get(g["id"], []))
         groups.append(g2)
     return {"groups": groups, "state": dict(_state["checked"])}
+
+
+def _broadcast_locked():
+    """Push the current checklist to every open event stream. Call while
+    holding _lock. Lock order is always _lock -> _subscribers_lock."""
+    payload = json.dumps(_checklist_payload_locked())
+    with _subscribers_lock:
+        for q in list(_subscribers):
+            try:
+                q.put_nowait(payload)
+            except queue.Full:
+                # A wedged client; it'll resync from its next full fetch.
+                pass
 
 
 def _ordered_groups(order, groups):
@@ -231,6 +254,35 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _serve_events(self):
+        """Server-Sent Events stream. Holds the connection (and this thread)
+        open for as long as the viewer has the page up, which is fine at
+        household scale — one thread per open tab."""
+        q = queue.Queue(maxsize=SSE_QUEUE_DEPTH)
+        with _subscribers_lock:
+            _subscribers.add(q)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            # Ask intermediaries not to buffer, or events arrive in clumps.
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            with _lock:
+                chunk = "data: %s\n\n" % json.dumps(_checklist_payload_locked())
+            while True:
+                self.wfile.write(chunk.encode("utf-8"))
+                self.wfile.flush()
+                try:
+                    chunk = "data: %s\n\n" % q.get(timeout=SSE_HEARTBEAT_SECONDS)
+                except queue.Empty:
+                    chunk = ": ping\n\n"
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            pass  # viewer closed the tab or dropped off the network
+        finally:
+            with _subscribers_lock:
+                _subscribers.discard(q)
+
     def _read_json_body(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length == 0:
@@ -259,6 +311,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload = _checklist_payload_locked()
             return self._send_json(payload)
 
+        if self.path == "/api/events":
+            return self._serve_events()
+
         self.send_response(404)
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -277,6 +332,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     _state["checked"][item_id] = checked
                     _save_state(_state)
+                    _broadcast_locked()
                     state_copy = dict(_state["checked"])
             if state_copy is None:
                 return self._send_json({"error": "unknown item id"}, status=400)
@@ -300,6 +356,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         items.append({"id": _next_extra_id(group_id), "text": text})
                         _save_state(_state)
+                        _broadcast_locked()
                         payload, error = _checklist_payload_locked(), None
             if payload is None:
                 return self._send_json({"error": error}, status=400)
@@ -323,6 +380,7 @@ class Handler(BaseHTTPRequestHandler):
                         "title": title,
                     })
                     _save_state(_state)
+                    _broadcast_locked()
                     payload = _checklist_payload_locked()
             if payload is None:
                 return self._send_json({"error": "too many sections"}, status=400)
@@ -339,6 +397,7 @@ class Handler(BaseHTTPRequestHandler):
                 if ok:
                     _state["order"] = order
                     _save_state(_state)
+                    _broadcast_locked()
             if not ok:
                 return self._send_json({"error": "invalid order"}, status=400)
             return self._send_json({"ok": True})
@@ -348,6 +407,7 @@ class Handler(BaseHTTPRequestHandler):
             with _lock:
                 _state["checked"].clear()
                 _save_state(_state)
+                _broadcast_locked()
             return self._send_json({"state": {}})
 
         self.send_response(404)

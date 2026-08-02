@@ -261,6 +261,7 @@ let state = {};
 let totalItems = 0;
 let dragging = false;
 let editing = false;  // an "add task" input is open
+let pending = null;   // update that arrived mid-drag/mid-edit, applied after
 
 function fmtId(groupId, idx) { return groupId + "-" + idx; }
 
@@ -383,6 +384,7 @@ function startDrag(e, blockEl, handle) {
     content.classList.remove("drag-active");
     dragging = false;
     commitOrder();
+    flushPending();
   };
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onUp);
@@ -509,6 +511,7 @@ function openNewSectionForm() {
   const close = () => {
     editing = false;
     renderNewSectionControl();
+    flushPending();
   };
   form.addEventListener("submit", async ev => {
     ev.preventDefault();
@@ -529,10 +532,7 @@ function openNewSectionForm() {
         return;
       }
       editing = false;
-      blocks = buildBlocks(data.groups);
-      state = data.state;
-      render();
-      setStatus("synced");
+      applyPayload(data, "synced");
     } catch (e) {
       setStatus("offline — try again");
       save.disabled = false;
@@ -580,6 +580,7 @@ function openAddRow(groupId, ul) {
   const close = () => {
     li.remove();
     editing = !!document.querySelector(".add-row");
+    flushPending();
   };
   const submit = async () => {
     if (save.disabled) return;
@@ -599,10 +600,7 @@ function openAddRow(groupId, ul) {
         return;
       }
       editing = false;
-      blocks = buildBlocks(data.groups);
-      state = data.state;
-      render();
-      setStatus("synced");
+      applyPayload(data, "synced");
     } catch (e) {
       setStatus("offline — try again");
       save.disabled = false;
@@ -646,19 +644,58 @@ function setStatus(text) {
   document.getElementById("statusLine").textContent = text;
 }
 
+// Apply a checklist payload, whether it came from a fetch or the event
+// stream. Updates that land mid-drag or mid-edit are held rather than
+// dropped, so nothing is missed once the user finishes.
+function applyPayload(data, statusText) {
+  if (dragging || editing) { pending = data; return; }
+  pending = null;
+  blocks = buildBlocks(data.groups);
+  state = data.state;
+  render();
+  if (statusText) setStatus(statusText);
+}
+
+function flushPending() {
+  if (pending && !dragging && !editing) applyPayload(pending, "updated just now");
+}
+
 async function loadChecklist() {
-  if (dragging || editing) return;  // don't yank the list out from under a drag or typing
+  if (dragging || editing) return;
   try {
     const res = await fetch("/api/checklist");
     const data = await res.json();
-    if (dragging || editing) return;  // may have started while we were fetching
-    blocks = buildBlocks(data.groups);
-    state = data.state;
-    render();
-    setStatus("synced just now");
+    applyPayload(data, streamOpen ? "live" : "synced just now");
   } catch (e) {
     setStatus("couldn't reach server");
   }
+}
+
+// Live updates over Server-Sent Events. EventSource reconnects on its own if
+// the connection drops, and carries the browser's saved sign-in automatically.
+let streamOpen = false;
+
+function connectEvents() {
+  let es;
+  try {
+    es = new EventSource("/api/events");
+  } catch (e) {
+    return;  // no EventSource support; the safety poll below carries it
+  }
+  es.addEventListener("open", () => {
+    streamOpen = true;
+    setStatus("live");
+  });
+  es.addEventListener("message", ev => {
+    streamOpen = true;
+    try {
+      applyPayload(JSON.parse(ev.data), "updated just now");
+    } catch (e) { /* ignore a malformed frame */ }
+  });
+  es.addEventListener("error", () => {
+    streamOpen = false;
+    setStatus("reconnecting…");
+  });
 }
 
 document.getElementById("resetBtn").addEventListener("click", async () => {
@@ -674,9 +711,12 @@ document.getElementById("resetBtn").addEventListener("click", async () => {
   }
 });
 
-// Initial load, then poll periodically so everyone sees each other's checks.
+// Initial paint, then live updates over the event stream. The slow poll is a
+// safety net for the case where a proxy eats the stream — normal updates
+// arrive pushed, in well under a second.
 loadChecklist();
-setInterval(loadChecklist, 4000);
+connectEvents();
+setInterval(loadChecklist, 30000);
 </script>
 </body>
 </html>
