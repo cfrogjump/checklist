@@ -4,6 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Party Checklist</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
+<!-- iOS home screen. 180x180, no transparency and no pre-rounded corners:
+     iOS composites on black and applies its own squircle mask. -->
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<!-- Short label under the icon; iOS truncates around 12 characters. -->
+<meta name="apple-mobile-web-app-title" content="Checklist">
+<meta name="theme-color" content="#b0592f">
 <style>
   :root {
     --paper: #faf7f2;
@@ -207,11 +215,56 @@
     accent-color: var(--accent);
     flex-shrink: 0;
   }
-  li label { cursor: pointer; flex: 1; }
-  li.checked label {
+  li .item-text {
+    cursor: pointer;
+    flex: 1;
+    /* Without these a long paste (a URL, say) pushes the page sideways
+       instead of wrapping. */
+    min-width: 0;
+    overflow-wrap: anywhere;
+    /* Long-press is the edit gesture, so suppress text selection and the
+       iOS press-and-hold callout that would otherwise fire first. */
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+  li.checked .item-text {
     color: #a39a8c;
     text-decoration: line-through;
   }
+  .item-grip {
+    background: none;
+    border: none;
+    padding: 0 2px;
+    margin-top: 2px;
+    color: #cfc6b8;
+    font-size: 0.85rem;
+    line-height: 1;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    flex-shrink: 0;
+  }
+  .item-grip:hover { color: var(--accent); }
+  .item-grip:active { cursor: grabbing; }
+  li.item-dragging {
+    background: var(--accent-soft);
+    border-radius: 6px;
+    box-shadow: 0 3px 10px rgba(43, 38, 32, 0.15);
+  }
+  .item-edit { display: flex; flex: 1; gap: 8px; min-width: 0; }
+  .item-edit input {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    padding: 4px 8px;
+    border: 1px solid var(--accent);
+    border-radius: 6px;
+    background: #fff;
+    color: var(--ink);
+  }
+  .item-edit input:focus { outline: none; }
   .quest-box {
     border: 1px dashed var(--accent);
     border-radius: 8px;
@@ -262,8 +315,6 @@ let totalItems = 0;
 let dragging = false;
 let editing = false;  // an "add task" input is open
 let pending = null;   // update that arrived mid-drag/mid-edit, applied after
-
-function fmtId(groupId, idx) { return groupId + "-" + idx; }
 
 // The three floor groups render inside one quest box, so they drag as a
 // single unit anchored wherever the first floor group sits in the order.
@@ -436,29 +487,196 @@ async function postOrder() {
 }
 
 function fillList(ul, group) {
-  const entries = group.items.map((text, idx) => ({ id: fmtId(group.id, idx), text }));
-  (group.extras || []).forEach(x => entries.push({ id: x.id, text: x.text }));
+  // Server sends the stored order; completed items sink to the bottom here,
+  // so ticking something doesn't rewrite everyone's saved order.
+  const entries = group.entries.slice().sort(
+    (a, b) => (state[a.id] ? 1 : 0) - (state[b.id] ? 1 : 0)
+  );
+  ul.dataset.groupId = group.id;
   entries.forEach(entry => {
     totalItems++;
     const checked = !!state[entry.id];
     const li = document.createElement("li");
+    li.dataset.itemId = entry.id;
     if (checked) li.classList.add("checked");
+    const grip = document.createElement("button");
+    grip.type = "button";
+    grip.className = "item-grip";
+    grip.textContent = "⠿";
+    grip.setAttribute("aria-label", "Drag to reorder this item");
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.id = entry.id;
     cb.checked = checked;
-    const label = document.createElement("label");
-    label.htmlFor = entry.id;
-    label.textContent = entry.text;  // textContent: item text is user-supplied
-    li.append(cb, label);
+    // A <span> we toggle ourselves rather than a <label for>: long-press has
+    // to be able to open the editor *without* also ticking the box, and
+    // cancelling a native label's activation is unreliable.
+    const text = document.createElement("span");
+    text.className = "item-text";
+    text.id = entry.id + "--t";
+    text.textContent = entry.text;  // textContent: item text is user-supplied
+    cb.setAttribute("aria-labelledby", text.id);
+    li.append(grip, cb, text);
     ul.appendChild(li);
     cb.addEventListener("change", () => toggle(entry.id, cb.checked, li));
+    grip.addEventListener("pointerdown", e => startItemDrag(e, li, grip, ul));
+    attachEditGestures(li, text, cb, entry);
   });
   if (!entries.length) {
     const hint = document.createElement("li");
     hint.className = "empty-hint";
     hint.textContent = "Nothing here yet — use + to add a task.";
     ul.appendChild(hint);
+  }
+}
+
+// ---- edit an item ---------------------------------------------------------
+// Press and hold the text (mouse or finger) to edit it. Long-press works the
+// same on both, which avoids double-click racing the label's tap-to-tick.
+
+const LONG_PRESS_MS = 500;
+
+function attachEditGestures(li, textEl, cb, entry) {
+  let timer = null, sx = 0, sy = 0, suppressClick = false;
+  const cancel = () => { clearTimeout(timer); timer = null; };
+
+  textEl.addEventListener("pointerdown", ev => {
+    sx = ev.clientX; sy = ev.clientY;
+    timer = setTimeout(() => {
+      timer = null;
+      suppressClick = true;
+      openItemEditor(li, entry);
+    }, LONG_PRESS_MS);
+  });
+  textEl.addEventListener("pointermove", ev => {
+    if (timer && Math.hypot(ev.clientX - sx, ev.clientY - sy) > 10) cancel();
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(t =>
+    textEl.addEventListener(t, cancel));
+
+  // Tapping the text ticks the box — except for the click that ends a long
+  // press, which opened the editor instead.
+  textEl.addEventListener("click", () => {
+    if (suppressClick) { suppressClick = false; return; }
+    cb.checked = !cb.checked;
+    toggle(entry.id, cb.checked, li);
+  });
+}
+
+function openItemEditor(li, entry) {
+  if (li.querySelector(".item-edit")) return;
+  editing = true;
+  const textEl = li.querySelector(".item-text");
+  const cb = li.querySelector("input[type=checkbox]");
+  const grip = li.querySelector(".item-grip");
+  [textEl, cb, grip].forEach(el => { if (el) el.hidden = true; });
+
+  const form = document.createElement("form");
+  form.className = "item-edit";
+  const input = document.createElement("input");
+  input.type = "text";
+  input.value = entry.text;
+  input.maxLength = 200;
+  const save = document.createElement("button");
+  save.type = "submit";
+  save.className = "add-save";
+  save.textContent = "Save";
+  form.append(input, save);
+  li.appendChild(form);
+  input.focus();
+  input.select();
+
+  const close = () => {
+    form.remove();
+    [textEl, cb, grip].forEach(el => { if (el) el.hidden = false; });
+    editing = !!document.querySelector(".add-row, .item-edit");
+    flushPending();
+  };
+  form.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    if (save.disabled) return;
+    const text = input.value.trim();
+    if (!text || text === entry.text) { close(); return; }
+    save.disabled = true;
+    try {
+      const res = await fetch("/api/edit-item", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: entry.id, text }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setStatus(data.error || "couldn't save edit");
+        save.disabled = false;
+        return;
+      }
+      editing = false;
+      applyPayload(data, "synced");
+    } catch (e) {
+      setStatus("offline — try again");
+      save.disabled = false;
+    }
+  });
+  input.addEventListener("keydown", ev => {
+    if (ev.key === "Escape") close();
+  });
+}
+
+// ---- reorder items within a section ---------------------------------------
+
+function startItemDrag(e, li, grip, ul) {
+  e.preventDefault();
+  dragging = true;
+  let lastY = e.clientY;
+  li.classList.add("item-dragging");
+  try { grip.setPointerCapture(e.pointerId); } catch (err) {}
+
+  const position = y => {
+    const others = [...ul.querySelectorAll("li[data-item-id]")].filter(el => el !== li);
+    let target = null;
+    for (const el of others) {
+      const r = el.getBoundingClientRect();
+      if (y < r.top + r.height / 2) { target = el; break; }
+    }
+    if (target) ul.insertBefore(li, target);
+    else ul.appendChild(li);
+  };
+  const onMove = ev => { lastY = ev.clientY; position(ev.clientY); };
+  const onUp = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onUp);
+    cancelAnimationFrame(raf);
+    li.classList.remove("item-dragging");
+    dragging = false;
+    commitItemOrder(ul);
+    flushPending();
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onUp);
+
+  let raf = requestAnimationFrame(function loop() {
+    if (!dragging) return;
+    const margin = 70, step = 12;
+    if (lastY < margin) window.scrollBy(0, -step);
+    else if (lastY > window.innerHeight - margin) window.scrollBy(0, step);
+    position(lastY);
+    raf = requestAnimationFrame(loop);
+  });
+}
+
+async function commitItemOrder(ul) {
+  const order = [...ul.querySelectorAll("li[data-item-id]")].map(el => el.dataset.itemId);
+  try {
+    const res = await fetch("/api/order-items", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group: ul.dataset.groupId, order }),
+    });
+    setStatus(res.ok ? "synced" : "couldn't save order");
+  } catch (e) {
+    setStatus("offline — will retry");
   }
 }
 

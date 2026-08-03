@@ -21,6 +21,7 @@ import json
 import os
 import queue
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -39,7 +40,19 @@ ALLOWED_NAMES = [
 ]
 _NAMES_BY_KEY = {name.casefold(): name for name in ALLOWED_NAMES}
 
-INDEX_HTML_PATH = Path(__file__).parent / "index.html"
+BASE_DIR = Path(__file__).parent
+INDEX_HTML_PATH = BASE_DIR / "index.html"
+
+# Served without a sign-in: iOS fetches the home screen icon in contexts that
+# don't always carry the saved credentials, and a 401 there means a blank or
+# screenshot icon. They contain nothing private.
+STATIC_FILES = {
+    "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    "/favicon-32.png": ("favicon-32.png", "image/png"),
+    "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
+    # iOS still probes this older name when adding to the home screen.
+    "/apple-touch-icon-precomposed.png": ("apple-touch-icon.png", "image/png"),
+}
 
 _lock = threading.Lock()
 
@@ -50,23 +63,37 @@ def _load_state():
             with STATE_FILE.open("r") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                known = ("checked", "order", "extras", "sections")
+                known = ("checked", "order", "extras", "sections",
+                         "overrides", "item_order")
                 if any(key in data for key in known):
-                    checked = data.get("checked")
-                    order = data.get("order")
-                    extras = data.get("extras")
-                    sections = data.get("sections")
                     return {
-                        "checked": checked if isinstance(checked, dict) else {},
-                        "order": order if isinstance(order, list) else [],
-                        "extras": extras if isinstance(extras, dict) else {},
-                        "sections": sections if isinstance(sections, list) else [],
+                        "checked": _as(data.get("checked"), dict),
+                        "order": _as(data.get("order"), list),
+                        "extras": _as(data.get("extras"), dict),
+                        "sections": _as(data.get("sections"), list),
+                        "overrides": _as(data.get("overrides"), dict),
+                        "item_order": _as(data.get("item_order"), dict),
                     }
                 # Legacy format: a flat {item_id: bool} dict.
-                return {"checked": data, "order": [], "extras": {}, "sections": []}
+                return _empty_state(checked=data)
         except (json.JSONDecodeError, OSError):
             pass
-    return {"checked": {}, "order": [], "extras": {}, "sections": []}
+    return _empty_state()
+
+
+def _as(value, kind):
+    return value if isinstance(value, kind) else kind()
+
+
+def _empty_state(checked=None):
+    return {
+        "checked": checked or {},
+        "order": [],
+        "extras": {},
+        "sections": [],
+        "overrides": {},
+        "item_order": {},
+    }
 
 
 def _save_state(state):
@@ -78,12 +105,16 @@ def _save_state(state):
 
 
 # In-memory cache of state, mirrored to disk on every write.
-# Shape: {"checked": {item_id: bool}, "order": [group_id, ...],
-#         "extras": {group_id: [{"id": "<gid>-x<n>", "text": str}, ...]},
-#         "sections": [{"id": "custom-<n>", "section": str, "title": str}]}
+# Shape: {"checked":    {item_id: bool},
+#         "order":      [group_id, ...],
+#         "extras":     {group_id: [{"id", "text", "created"}, ...]},
+#         "sections":   [{"id": "custom-<n>", "section": str, "title": str}],
+#         "overrides":  {item_id: str},          # edited item text
+#         "item_order": {group_id: [item_id, ...]}}  # manual item order
 # "extras" and "sections" are user-added; the baked-in checklist lives in
 # checklist_items.py. User-added sections have no baked-in items of their
-# own — everything in them is an "extras" entry.
+# own — everything in them is an "extras" entry. Editing a baked-in item
+# doesn't touch checklist_items.py, it just records an override here.
 _state = _load_state()
 
 MAX_ITEM_TEXT = 200
@@ -152,12 +183,46 @@ def _all_group_ids_locked():
     return {g["id"] for g in _all_groups_locked()}
 
 
+def _entry_texts_locked(group):
+    """Every item id in a group mapped to its text, before overrides."""
+    texts = {f"{group['id']}-{i}": t for i, t in enumerate(group["items"])}
+    for extra in _state["extras"].get(group["id"], []):
+        texts[str(extra["id"])] = extra["text"]
+    return texts
+
+
+def _entry_ids_by_entry_date_locked(group):
+    """The default order: baked-in items as listed in checklist_items.py,
+    then added items in the order they were entered."""
+    ids = [f"{group['id']}-{i}" for i in range(len(group["items"]))]
+    ids += [str(x["id"]) for x in _state["extras"].get(group["id"], [])]
+    return ids
+
+
+def _ordered_entries_locked(group):
+    """Items in stored display order: the manual order someone dragged into
+    place, then anything not in it (just-added items, or new entries in
+    checklist_items.py) by entry date. Completed items are sunk to the bottom
+    by the UI rather than here, so ticking something doesn't churn the stored
+    order."""
+    texts = _entry_texts_locked(group)
+    saved = _state["item_order"].get(group["id"], [])
+    ordered = [i for i in saved if i in texts]
+    seen = set(ordered)
+    ordered += [i for i in _entry_ids_by_entry_date_locked(group) if i not in seen]
+    overrides = _state["overrides"]
+    return [{"id": i, "text": overrides.get(i, texts[i])} for i in ordered]
+
+
 def _checklist_payload_locked():
     groups = []
     for g in _ordered_groups(_state["order"], _all_groups_locked()):
-        g2 = dict(g)
-        g2["extras"] = list(_state["extras"].get(g["id"], []))
-        groups.append(g2)
+        groups.append({
+            "section": g["section"],
+            "id": g["id"],
+            "title": g["title"],
+            "entries": _ordered_entries_locked(g),
+        })
     return {"groups": groups, "state": dict(_state["checked"])}
 
 
@@ -246,11 +311,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_file(self, path, content_type):
-        data = path.read_bytes()
+    def _send_file(self, path, content_type, cache_seconds=None):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        if cache_seconds:
+            self.send_header("Cache-Control", f"public, max-age={cache_seconds}")
         self.end_headers()
         self.wfile.write(data)
 
@@ -299,6 +372,11 @@ class Handler(BaseHTTPRequestHandler):
         # Left open so container/uptime health checks don't need credentials.
         if self.path == "/healthz":
             return self._send_json({"ok": True})
+
+        static = STATIC_FILES.get(self.path)
+        if static:
+            name, content_type = static
+            return self._send_file(BASE_DIR / name, content_type, cache_seconds=86400)
 
         if not self._authorized():
             return self._require_auth()
@@ -354,13 +432,60 @@ class Handler(BaseHTTPRequestHandler):
                     if len(items) >= MAX_EXTRAS_PER_GROUP:
                         payload, error = None, "section is full"
                     else:
-                        items.append({"id": _next_extra_id(group_id), "text": text})
+                        items.append({
+                            "id": _next_extra_id(group_id),
+                            "text": text,
+                            "created": int(time.time()),
+                        })
                         _save_state(_state)
                         _broadcast_locked()
                         payload, error = _checklist_payload_locked(), None
             if payload is None:
                 return self._send_json({"error": error}, status=400)
             return self._send_json(payload)
+
+        if self.path == "/api/edit-item":
+            body = self._read_json_body()
+            item_id = body.get("id")
+            text = str(body.get("text") or "").strip()[:MAX_ITEM_TEXT]
+            if not text:
+                return self._send_json({"error": "empty item text"}, status=400)
+            with _lock:
+                if item_id not in _valid_item_ids_locked():
+                    payload = None
+                else:
+                    # Recorded as an override so baked-in items from
+                    # checklist_items.py are editable without a rebuild.
+                    _state["overrides"][item_id] = text
+                    _save_state(_state)
+                    _broadcast_locked()
+                    payload = _checklist_payload_locked()
+            if payload is None:
+                return self._send_json({"error": "unknown item id"}, status=400)
+            return self._send_json(payload)
+
+        if self.path == "/api/order-items":
+            body = self._read_json_body()
+            group_id = body.get("group")
+            order = body.get("order")
+            if not isinstance(order, list) or len(order) != len(set(map(str, order))):
+                return self._send_json({"error": "invalid order"}, status=400)
+            with _lock:
+                group = next(
+                    (g for g in _all_groups_locked() if g["id"] == group_id), None
+                )
+                if group is None:
+                    ok = False
+                else:
+                    known = set(_entry_texts_locked(group))
+                    ok = all(isinstance(i, str) and i in known for i in order)
+                if ok:
+                    _state["item_order"][group_id] = order
+                    _save_state(_state)
+                    _broadcast_locked()
+            if not ok:
+                return self._send_json({"error": "invalid order"}, status=400)
+            return self._send_json({"ok": True})
 
         if self.path == "/api/add-section":
             body = self._read_json_body()

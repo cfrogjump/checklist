@@ -13,6 +13,18 @@ Sections can be reordered by dragging the ⠿ handle next to each title
 sees the same arrangement. The three "Floor Side Quest" groups move as a
 single box.
 
+Individual tasks work the same way: drag the small grip at the left of a
+row to reorder it **within its section**, and **press and hold** the task
+text (mouse or finger, about half a second) to edit the wording inline.
+Editing works on the built-in tasks too — it records an override rather
+than changing `checklist_items.py`, so no rebuild is needed.
+
+Tasks default to the order they were entered: built-in ones as listed in
+`checklist_items.py`, then added ones oldest-first. Dragging overrides that
+for the tasks you move. **Completed tasks drop to the bottom of their
+section**, which happens at display time only — the saved order is left
+alone, so unticking something puts it back where it was.
+
 Each section also has a "+" button on the right of its title (one per
 sub-list inside the quest box) that opens an inline input for adding a
 task. A "+ New section" button at the bottom of the page creates a whole
@@ -49,6 +61,27 @@ docker run -d --name party-checklist \
   -v "$(pwd)/data:/data" \
   party-checklist
 ```
+
+## Add it to a phone home screen
+
+On iPhone, open the checklist in Safari → Share → **Add to Home Screen**. It
+gets a proper icon (a cream checkmark on the app's terracotta) labelled
+"Checklist", not a screenshot of the page.
+
+The icons are committed files — `apple-touch-icon.png` (180×180 for iOS),
+`favicon.svg` and `favicon-32.png` (browser tabs). They're served without a
+sign-in, because iOS fetches the home screen icon in contexts that don't
+always carry saved credentials and a 401 there gets you a blank icon.
+
+To recolour or redraw them, edit and run `tools/make_icons.py` (needs
+`pip install Pillow` — only to regenerate; the server itself still has no
+dependencies), then rebuild.
+
+Tapping the home screen icon opens the checklist in a normal Safari view.
+Adding `<meta name="apple-mobile-web-app-capable" content="yes">` to
+`index.html` would make it launch fullscreen like a native app instead —
+left off on purpose, because a standalone web app keeps its own credential
+store and would likely re-prompt for your name on every cold launch.
 
 ## Signing in
 
@@ -181,8 +214,10 @@ to add new items at the end of a group, or do a reset after editing.
 
 ## API (in case you want to script against it)
 
-- `GET /api/checklist` → `{ groups: [...], state: { "<id>": true/false } }`
-  (groups come back in the saved display order)
+- `GET /api/checklist` → `{ groups: [...], state: { "<id>": true/false } }`.
+  Groups come back in the saved display order, each with an `entries` array
+  of `{ id, text }` already in stored item order and with any edits applied.
+  (Sinking completed tasks is the UI's job, not this endpoint's.)
 - `GET /api/events` → Server-Sent Events stream. Sends the full
   `/api/checklist` payload on connect and again after every write, plus a
   `: ping` comment every 25s so idle streams survive proxy timeouts
@@ -194,6 +229,13 @@ to add new items at the end of a group, or do a reset after editing.
 - `POST /api/add-item` body `{ "group": "kitchen", "text": "Buy ice" }` → adds
   a task to that section (text capped at 200 chars, 100 added tasks per
   section); returns the same payload as `/api/checklist`
+- `POST /api/edit-item` body `{ "id": "kitchen-2", "text": "New wording" }` →
+  changes a task's text (built-in or added, 200-char cap); returns the same
+  payload as `/api/checklist`
+- `POST /api/order-items` body `{ "group": "kitchen", "order": ["kitchen-2", ...] }`
+  → saves the task order within one section. Ids must all belong to that
+  section; a partial list is fine, anything left out falls in behind by
+  entry order.
 - `POST /api/add-section` body `{ "title": "Garage", "area": "Outside" }` →
   adds a section (title capped at 60 chars, 30 sections max; `area` defaults
   to the last built-in area); returns the same payload as `/api/checklist`
@@ -201,8 +243,10 @@ to add new items at the end of a group, or do a reset after editing.
   any added tasks and sections)
 - `GET /healthz` → `{ "ok": true }`
 
-`state.json` is stored as
-`{ "checked": {...}, "order": [...], "extras": {...}, "sections": [...] }`.
+`state.json` is stored as `{ "checked": {...}, "order": [...],
+"extras": {...}, "sections": [...], "overrides": {...}, "item_order": {...} }`
+— `overrides` holds edited task text keyed by item id, `item_order` the
+per-section task order.
 Older files — including the original flat map of item ids — are migrated
 automatically on startup. Added tasks get ids like `kitchen-x3` and added
 sections get `custom-1`; both namespaces are kept clear of the index-based
