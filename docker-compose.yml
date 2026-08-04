@@ -1,5 +1,9 @@
 services:
   checklist:
+    # Published by CI on every push to main. `docker compose pull` fetches it,
+    # so the box running this doesn't need to build anything. `build:` is kept
+    # so `docker compose up -d --build` still works for local changes.
+    image: ghcr.io/cfrogjump/checklist:latest
     build: .
     container_name: party-checklist
     ports:

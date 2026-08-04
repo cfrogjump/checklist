@@ -42,25 +42,57 @@ standard library, so the image builds fully offline once the base
 
 ## Run it
 
+Every push to `main` builds and publishes `ghcr.io/cfrogjump/checklist`, so
+the machine running this doesn't have to build anything:
+
 ```bash
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
 Then open http://localhost:8080
+
+To run your own local changes instead of the published image:
+
+```bash
+docker compose up -d --build
+```
 
 Data persists in `./data/state.json` on the host, so `docker compose down`
 / `up` again won't lose anyone's progress. Delete that file (or click
 "Reset all" in the UI) to start over.
 
+> **First pull will fail until the package is public.** GitHub creates
+> packages as private even for public repos. Open the package on GitHub →
+> Package settings → Change visibility → Public. The image holds nothing
+> secret that this repo doesn't already. If you'd rather keep it private,
+> `docker login ghcr.io -u <you>` on the host with a PAT that has
+> `read:packages` instead.
+
 ### Without compose
 
 ```bash
-docker build -t party-checklist .
 docker run -d --name party-checklist \
   -p 8080:8080 \
   -v "$(pwd)/data:/data" \
-  party-checklist
+  ghcr.io/cfrogjump/checklist:latest
 ```
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+Standard library only, no install step. They cover the state-file migrations,
+group and item ordering, id allocation, the sign-in rules, and every endpoint
+including the event stream.
+
+CI (`.github/workflows/ci.yml`) runs those on every push and pull request,
+checks the page's inline script parses, and — on `main` — builds the image,
+pushes it to GHCR tagged `latest` and `sha-<commit>`, then starts the pushed
+image and checks it answers `/healthz`, still demands a name, and has the
+icons baked in. Pull requests build the image and smoke-test it without
+pushing.
 
 ## Add it to a phone home screen
 
